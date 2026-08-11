@@ -31,7 +31,7 @@ tail -f ~/Desktop/meeting-notes/transcripts/작업로그.log   # 진행 확인
 
 창이 스스로 닫히는데도 녹음이 안 죽는 이유: 터미널은 창에 매달린 프로세스가 하나라도 있으면
 창을 닫지 않으므로, 실행기가 `setsid`(python3 경유)로 새 세션을 만들어 창과의 연결을 끊고
-`nohup`으로 SIGHUP까지 무시시킨다. 그래서 창이 닫혀도 ffmpeg·whisper·claude 가 계속 돈다.
+`nohup`으로 SIGHUP까지 무시시킨다. 그래서 창이 닫혀도 녹음기·whisper·claude 가 계속 돈다.
 
 호출 경로를 바꾸려면 `~/Library/Services/회의 녹음.workflow` 의 `COMMAND_STRING`.
 
@@ -69,17 +69,33 @@ tail -f ~/Desktop/meeting-notes/transcripts/작업로그.log   # 진행 확인
 ## 파이프라인
 
 ```
-recordings/*.m4a
-  → ffmpeg (16kHz mono WAV)
-  → whisper-cli large-v3, 한국어 (glossary 상단 용어를 --prompt 로 주입)
+마이크 → ~/bin/meeting-recorder (16kHz mono WAV)   ← 터치바 버튼으로 녹음할 때
+recordings/*.wav|*.m4a
+  → 손실 자가점검 (녹음 시간 vs 파일 길이가 5% 이상 어긋나면 경고)
+  → ffmpeg (형식 변환만: 16kHz mono WAV)
+  → whisper-cli large-v3, 한국어 (-mc 0 : 직전 문장을 다음 구간 힌트로 물려주지 않음)
+  → 반복 자가점검 (같은 문장 반복 고장이면 여기서 중단)
   → claude -p --model opus (template.md 양식 + glossary 전체로 오전사 교정)
 ```
+
+**마이크 녹음에는 ffmpeg 을 쓰지 않는다**(형식 변환에는 계속 쓴다). ffmpeg 의 avfoundation 입력은 마이크 버퍼를 한 칸만 들고
+있어서, 읽기가 조금만 늦으면 그 버퍼를 통째로 버린다 — CPU 가 놀고 있어도 소리가 조용히 샌다.
+2026-08-11 실측으로 같은 조건 40초 비교에서 **`meeting-recorder` 100.0% vs ffmpeg 91.8%** 였고,
+실제 회의에서는 16분 23초를 녹음했는데 파일엔 15분 13초(70초 증발)만 담겼다. 빠진 자리는
+그냥 이어붙어서 **재생하면 멀쩡하게 들리지만 단어 조각이 실제로 없다.** `-thread_queue_size`
+를 키우거나 리샘플링을 빼도 그대로다 — ffmpeg 옵션으로는 못 고친다.
+경위는 `bin/meeting-recorder.swift` 머리말 참고.
+
+**whisper 에 용어집을 힌트(`--prompt`)로 넣지 않는다.** 넣으면 전사가 같은 문장만 끝없이
+복사하는 고장에 빠진다 — 2026-08-11 에 15분 회의 전사가 서로 다른 문장 3개로만 채워졌다.
+경위와 A/B 재현 결과는 `bin/transcribe.sh` 의 3번 절 주석에 적어 뒀다. 용어 교정은
+마지막 Claude 단계가 용어집 전체를 보고 하므로 정확도 손해는 없다.
 
 ## 설정 파일
 
 - **`config/glossary.txt`** — 회사 용어집. 형식: `올바른 표기 | 흔한 오전사 | 설명`
-  - 위에서부터 최대 40개(~350자)가 whisper 프롬프트에 주입됨 → **자주 쓰는 핵심 용어를 위쪽에**
-  - 전체 목록은 Claude 후처리 교정에 사용됨 (개수 제한 없음)
+  - Claude 후처리 교정에만 사용됨 (순서·개수 제한 없음)
+  - **2번째 칸(흔한 오전사)을 채워둘수록 교정이 정확해짐**
 - **`config/template.md`** — 회의록 양식(표준형). 수정하면 다음 실행부터 바로 반영.
 
 ## 속도가 너무 느리면 (양자화 모델 옵션)
@@ -110,9 +126,10 @@ brew install ffmpeg whisper-cpp        # claude CLI 는 별도 설치·로그인
 curl -L -o models/ggml-large-v3.bin \
   "https://huggingface.co/ggerganov/whisper.cpp/resolve/main/ggml-large-v3.bin"
 
-# 4) 터치바용 실행기와 메뉴바 표시기를 '바탕화면 밖'에 설치 — ⚠ 이 위치가 중요하다
+# 4) 터치바용 실행기·녹음기·메뉴바 표시기를 '바탕화면 밖'에 설치 — ⚠ 이 위치가 중요하다
 mkdir -p ~/bin
 cp bin/meeting-record-toggle.command ~/bin/ && chmod +x ~/bin/meeting-record-toggle.command
+swiftc -O -o ~/bin/meeting-recorder bin/meeting-recorder.swift          # 마이크 녹음기 (필수)
 cp bin/meeting-rec-indicator.swift ~/bin/
 swiftc -O -o ~/bin/meeting-rec-indicator ~/bin/meeting-rec-indicator.swift
 
@@ -136,3 +153,11 @@ open -a Terminal "$HOME/bin/meeting-record-toggle.command"
 - `whisper 모델이 없습니다` → 에러 메시지에 나오는 curl 명령으로 모델(~3GB) 재다운로드
 - 회의록이 비어 있음 → `claude` CLI 로그인 상태 확인 (`claude` 실행해 확인)
 - 전사 품질 낮음 → glossary.txt에 해당 용어 추가(흔한 오전사 칸까지 채우면 효과 큼)
+- `전사가 '같은 문장 반복' 고장에 빠졌습니다` → 자가점검이 걸러낸 것. 회의록은 만들지 않고
+  전사 원본만 남는다. `transcripts/*.txt` 를 열어 확인하고, 대개는 녹음이 너무 작거나
+  잡음이 큰 게 원인이므로 마이크 위치·입력 볼륨부터 점검할 것
+- `⚠ 소리 N% 빠짐` 알림 → 녹음기가 소리를 흘리고 있다는 뜻(재생해선 알 수 없다).
+  `~/bin/meeting-recorder` 가 설치돼 있는지 먼저 확인(`ls -l ~/bin/meeting-recorder`).
+  없으면 ffmpeg 대체 경로로 녹음된 것이므로 위 4번 빌드 명령으로 녹음기를 설치할 것
+- 전사 결과가 부정확함 → 녹음 소리가 작으면(말소리가 배경소음보다 15dB 미만) 정확도가 크게
+  떨어진다. 마이크를 화자 쪽으로 두고 시스템 설정 > 사운드 > 입력 볼륨을 올릴 것

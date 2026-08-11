@@ -33,11 +33,11 @@ fi
 # 왜 nohup 만으로는 부족한가:
 #   터미널은 '그 창에 매달린 프로세스가 하나라도 있으면' 창을 닫지 않는다.
 #   nohup/disown 은 신호와 잡 목록만 떼어낼 뿐 제어터미널(ctty) 연결은 그대로라,
-#   ffmpeg 가 녹음하는 내내 창이 busy 로 남아 자동 닫기가 조용히 실패한다.
+#   녹음기가 도는 내내 창이 busy 로 남아 자동 닫기가 조용히 실패한다.
 #   → setsid 로 새 세션을 만들어 ctty 자체를 끊는다. macOS엔 setsid 명령이 없어 python3 사용.
 #
 # nohup 도 함께 유지: SIGHUP 무시는 exec 후에도 자식에 상속되므로
-# 이 아래로 이어지는 ffmpeg·whisper·claude 까지 전부 보호된다.
+# 이 아래로 이어지는 녹음기·whisper·claude 까지 전부 보호된다.
 nohup /usr/bin/python3 -c '
 import os, sys
 try:

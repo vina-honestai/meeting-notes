@@ -27,9 +27,10 @@ MODEL="${WHISPER_MODEL:-$BASE/models/ggml-large-v3.bin}"
 GLOSSARY="$BASE/config/glossary.txt"
 TEMPLATE="$BASE/config/template.md"
 
-# whisper --prompt 주입 한도 (~224토큰 안전선)
-PROMPT_MAX_TERMS=40
-PROMPT_MAX_CHARS=350
+# 전사 자가점검 기준 (아래 3-1 참고). 최다 반복 문장이 이 %를 넘거나,
+# 서로 다른 문장이 이 % 이하이면 '반복 고장'으로 보고 중단한다.
+REPEAT_MAX_PCT=30
+UNIQUE_MIN_PCT=40
 
 log() { printf '\033[1;34m[%s]\033[0m %s\n' "$(date +%H:%M:%S)" "$*"; }
 die() { printf '\033[1;31m[오류]\033[0m %s\n' "$*" >&2; exit 1; }
@@ -104,32 +105,24 @@ log "1/3 ffmpeg: 16kHz mono WAV 변환 중..."
 ffmpeg -y -hide_banner -loglevel error -i "$INPUT" -ar 16000 -ac 1 -c:a pcm_s16le "$WAV"
 
 # ---------- 3. whisper 전사 ----------
-# glossary 상단부터 1번째 칸(올바른 표기)을 추출해 초기 프롬프트로 주입
-PROMPT_TERMS=""
-TERM_COUNT=0
-if [ -f "$GLOSSARY" ]; then
-  while IFS= read -r line; do
-    term="${line%%|*}"
-    term="$(printf '%s' "$term" | sed -e 's/^[[:space:]]*//' -e 's/[[:space:]]*$//')"
-    if [ -z "$term" ] || [ "${term#\#}" != "$term" ]; then continue; fi
-    if [ -n "$PROMPT_TERMS" ]; then
-      candidate="$PROMPT_TERMS, $term"
-    else
-      candidate="$term"
-    fi
-    if [ "${#candidate}" -gt "$PROMPT_MAX_CHARS" ]; then break; fi
-    PROMPT_TERMS="$candidate"
-    TERM_COUNT=$((TERM_COUNT + 1))
-    if [ "$TERM_COUNT" -ge "$PROMPT_MAX_TERMS" ]; then break; fi
-  done < "$GLOSSARY"
-fi
-
+# ⚠ 용어집을 whisper 초기 프롬프트로 주입하지 않는다 (--prompt / --carry-initial-prompt 금지).
+#
+#   2026-08-11 사고: 15분 회의 전사가 "서로 다른 문장 3개"로만 채워졌다(1개 + 141회 반복 + 19회 반복).
+#   원인은 용어집 프롬프트 주입 + whisper 기본동작(직전 구간의 문장을 다음 구간 힌트로 물려주기)의
+#   조합이다. 한 번 어긋난 문장이 자기 자신을 힌트로 재입력받아 녹음 끝까지 자기복제한다.
+#   whisper 는 이 상태를 스스로 못 잡는다(그 회차 로그의 재시도 fallbacks = 6p/4h, 15분 동안 10회뿐).
+#
+#   같은 오디오 60초로 A/B 재현(조건 외 전부 동일, -t 4):
+#     프롬프트 주입 그대로        → 같은 문장 반복 (사고 재현)
+#     프롬프트만 제거             → 정상
+#     프롬프트 두고 -mc 0 만 추가 → 정상
+#     프롬프트 두고 볼륨만 정규화 → 여전히 반복 (음량 문제가 아님)
+#
+#   용어 교정은 4단계에서 Claude 가 용어집 '전체'를 보고 하므로 잃는 게 없다.
+#
+# -mc 0 : 직전 구간의 문장을 다음 구간 힌트로 물려주지 않음 — 되먹임 경로를 끊는 2차 안전장치.
 OUT_BASE="$TRANSCRIPTS/${MEET_DATE}_${NAME}"
-WHISPER_ARGS=(-m "$MODEL" -l ko -otxt -osrt -of "$OUT_BASE")
-if [ -n "$PROMPT_TERMS" ]; then
-  WHISPER_ARGS+=(--prompt "$PROMPT_TERMS" --carry-initial-prompt)
-  log "용어집 프롬프트 주입: ${TERM_COUNT}개 용어"
-fi
+WHISPER_ARGS=(-m "$MODEL" -l ko -mc 0 -otxt -osrt -of "$OUT_BASE")
 
 log "2/3 whisper 전사 시작 (large-v3, 한국어) — 진행되는 대로 문장이 출력됩니다"
 START_TS=$(date +%s)
@@ -141,6 +134,26 @@ fi
 log "전사 완료 ($(( ($(date +%s) - START_TS) / 60 ))분 소요) → ${OUT_BASE}.txt / .srt"
 
 [ -s "${OUT_BASE}.txt" ] || die "전사 결과가 비어 있습니다: ${OUT_BASE}.txt"
+
+# ---------- 3-1. 전사 자가점검 (같은 문장 반복 고장) ----------
+# whisper 는 반복 고장에 빠져도 스스로 알아채지 못한다. 망가진 전사를 그대로 넘기면
+# '그럴듯한 가짜 회의록'이 나오므로(2026-08-11 사고) 회의록 작성 전에 끊는다.
+# 전사 원본(.txt/.srt)은 지우지 않고 남긴다 — 사람이 눈으로 확인할 수 있게.
+CHECK="$(awk 'NF { n++; c[$0]++; if (c[$0] > mx) mx = c[$0] }
+  END { if (n < 20) { print "skip"; exit }
+        u = 0; for (k in c) u++
+        printf "%d %d %d %d %d\n", n, u, mx, mx*100/n, u*100/n }' "${OUT_BASE}.txt")"
+
+if [ "$CHECK" != "skip" ]; then
+  read -r LINES UNIQ MAXREP MAXPCT UNIQPCT <<< "$CHECK"
+  log "전사 자가점검: ${LINES}줄 / 서로 다른 문장 ${UNIQ}종(${UNIQPCT}%) / 최다 반복 ${MAXREP}회(${MAXPCT}%)"
+  if [ "$MAXPCT" -ge "$REPEAT_MAX_PCT" ] || [ "$UNIQPCT" -le "$UNIQUE_MIN_PCT" ]; then
+    die "전사가 '같은 문장 반복' 고장에 빠졌습니다 — 회의록을 만들지 않고 멈춥니다.
+  ${LINES}줄 중 서로 다른 문장이 ${UNIQ}종뿐이고, 한 문장이 ${MAXREP}번(${MAXPCT}%) 반복됐습니다.
+  전사 원본은 남겨뒀습니다: ${OUT_BASE}.txt
+  녹음 소리가 너무 작거나 잡음이 클 때 잘 생깁니다 — 녹음 상태부터 확인하세요."
+  fi
+fi
 
 # ---------- 4. Claude Opus 회의록 작성 ----------
 MINUTES_FILE="$MINUTES/회의록_${MEET_DATE}_${NAME}.md"
